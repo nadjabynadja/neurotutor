@@ -40,7 +40,7 @@ const ProfessorDashboard = () => {
     try {
       const res = await fetch(`http://localhost:8000/api/professor/courses/${courseId}/students`);
       const data = await res.json();
-      setStudents(data);
+      setStudents(data.students ?? []);
     } catch (err) {
       console.error('Failed to fetch students:', err);
     }
@@ -124,8 +124,8 @@ const ProfessorDashboard = () => {
                 <div style={styles.engagementBar}>
                   <div style={{
                     ...styles.engagementFill,
-                    width: `${course.average_engagement * 100}%`,
-                    backgroundColor: getScoreColor(course.average_engagement)
+                    width: `${((1 - (course.at_risk_count / (course.student_count || 1))) * 100).toFixed(0)}%`,
+                    backgroundColor: getScoreColor(1 - (course.at_risk_count / (course.student_count || 1)))
                   }} />
                 </div>
               </div>
@@ -247,7 +247,7 @@ const ScoreBar = ({ value, invert = false }) => {
 
 const MetricCard = ({ title, value, color = '#333' }) => (
   <div style={styles.metricCard}>
-    <div style={styles.metricValue} style={{ color }}>{value}</div>
+    <div style={{ ...styles.metricValue, color }}>{value}</div>
     <div style={styles.metricTitle}>{title}</div>
   </div>
 );

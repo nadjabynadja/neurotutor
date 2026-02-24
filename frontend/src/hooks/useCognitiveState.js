@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+const WS_BASE = API_BASE.replace(/^http/, 'ws');
 
 export const useCognitiveState = (sessionId) => {
   const [cognitiveState, setCognitiveState] = useState(null);
@@ -71,7 +72,7 @@ export const useCognitiveState = (sessionId) => {
   useEffect(() => {
     if (!isTracking) return;
 
-    const ws = new WebSocket(`${API_BASE}/ws/cognitive/${sessionId}`);
+    const ws = new WebSocket(`${WS_BASE}/ws/cognitive/${sessionId}`);
     wsRef.current = ws;
 
     ws.onopen = () => {
