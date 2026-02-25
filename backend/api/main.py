@@ -9,9 +9,11 @@ from datetime import datetime
 import json
 import asyncio
 import os
+import uuid
 
 # Import our modules
 from cognitive.attention_detector import AttentionDetector
+from cognitive.webcam_simulator import WebcamSimulator
 from llm.directive_engine import DirectiveEngine, DirectiveMapper, CognitiveState as DirectiveCognitiveState, Directive
 from llm.minimax_client import NeuroTutorLLM
 
@@ -90,10 +92,33 @@ async def root():
 
 @app.get("/health")
 async def health():
+    # Test simulator availability
+    try:
+        test_sim = WebcamSimulator()
+        test_sim.start()
+        simulator_ok = True
+        test_sim.stop()
+    except Exception:
+        simulator_ok = False
+
+    # Test camera availability (non-blocking check)
+    try:
+        import cv2
+        cap = cv2.VideoCapture(0)
+        camera_ok = cap.isOpened()
+        cap.release()
+    except Exception:
+        camera_ok = False
+
     return {
         "status": "healthy",
         "llm_configured": llm.client.is_configured(),
-        "llm_provider": "MiniMax" if llm.client.is_configured() else None
+        "llm_provider": "MiniMax" if llm.client.is_configured() else None,
+        "simulator_available": simulator_ok,
+        "camera_available": camera_ok,
+        "active_sessions": len(attention_detectors),
+        "active_simulators": len(webcam_simulators),
+        "demo_mode": not camera_ok and simulator_ok,
     }
 
 
@@ -192,6 +217,47 @@ async def analyze_directive(request: DirectiveRequest):
 
 # ============== Chat (LLM Integration) ==============
 
+def _build_demo_response(message: str, directives: list, state) -> str:
+    """
+    Build a clean, tutor-sounding response for demo mode (no API key configured).
+    Adapts tone based on cognitive state without leaking internal directive text.
+    """
+    directive_values = [d.value for d in directives]
+
+    # Choose an opening based on highest-priority directive
+    if "break" in directive_values:
+        opening = "You've been working hard — let's take this one step at a time."
+    elif "simplify" in directive_values or "slow_down" in directive_values:
+        opening = "Let me walk you through this step by step."
+    elif "encourage" in directive_values:
+        opening = "You're doing great — let's work through this together."
+    elif "speed_up" in directive_values:
+        opening = "You're clearly getting the hang of this — let's go deeper."
+    elif "example" in directive_values:
+        opening = "Great question — here's a concrete way to think about it."
+    else:
+        opening = "That's a great question!"
+
+    # Build adaptive body
+    body = f'You asked about: "{message}". '
+
+    if state.confusion_indicator > 0.6:
+        body += "This can feel tricky at first. Let's start from the basics and build up gradually. "
+    elif state.cognitive_load > 0.7:
+        body += "Let's break this into smaller pieces — no rush. "
+    elif state.fatigue_indicator > 0.6:
+        body += "I'll keep this concise so we don't overload you right now. "
+    elif state.attention_level > 0.8 and state.cognitive_load < 0.5:
+        body += "You're in a great learning flow — I'll give you the full picture. "
+
+    footer = (
+        "To unlock full AI-powered responses, set the MINIMAX_API_KEY "
+        "environment variable and restart the backend."
+    )
+
+    return f"{opening} {body}\n\n_{footer}_"
+
+
 @app.post("/chat")
 async def chat(request: ChatRequest):
     """
@@ -243,21 +309,14 @@ async def chat(request: ChatRequest):
             llm_provider="MiniMax"
         )
     
-    # Fallback simulation
-    prompt_prefix = directive_engine.build_prompt_prefix(directives)
-    response = f"{prompt_prefix}I understand you're asking about: {request.message}"
-    
-    if state.confusion_indicator > 0.6:
-        response += "\n\nI notice you might be finding this challenging. Let me break it down more simply."
-    
-    if state.fatigue_indicator > 0.6:
-        response += "\n\nYou seem tired. Would you like to take a short break?"
-    
+    # Fallback: produce a clean, natural-sounding tutor response (no API key needed)
+    response = _build_demo_response(request.message, directives, state)
+
     return ChatResponse(
         response=response,
         directives=[d.value for d in directives],
         cognitive_state=state_dict,
-        llm_provider=None
+        llm_provider="demo"
     )
 
 
@@ -265,26 +324,46 @@ async def chat(request: ChatRequest):
 
 @app.websocket("/ws/cognitive/{session_id}")
 async def websocket_cognitive(websocket: WebSocket, session_id: str):
-    """WebSocket for real-time cognitive state streaming."""
+    """
+    WebSocket for real-time cognitive state streaming.
+    Tries the physical webcam first; falls back to WebcamSimulator automatically
+    so the demo works without any camera hardware.
+    """
     await websocket.accept()
-    
+
+    # Try real camera; fall back to simulator for demo/no-hardware environments
     detector = AttentionDetector()
-    if not detector.start():
-        await websocket.send_json({"error": "Failed to start camera"})
-        await websocket.close()
-        return
-    
+    use_simulator = not detector.start()
+
+    sim = None
+    if use_simulator:
+        detector.stop()
+        sim = WebcamSimulator()
+        sim.start()
+
     try:
         while True:
-            state = detector.get_cognitive_state()
-            await websocket.send_json(state.to_dict())
+            if use_simulator:
+                state_data = sim.get_state_dict()
+            else:
+                state = detector.get_cognitive_state()
+                state_data = state.to_dict()
+
+            await websocket.send_json(state_data)
             await asyncio.sleep(0.5)
-    
+
     except WebSocketDisconnect:
-        detector.stop()
+        pass
     except Exception as e:
-        await websocket.send_json({"error": str(e)})
-        detector.stop()
+        try:
+            await websocket.send_json({"error": str(e)})
+        except Exception:
+            pass
+    finally:
+        if use_simulator and sim:
+            sim.stop()
+        elif not use_simulator:
+            detector.stop()
 
 
 # ============== Course Management ==============
@@ -520,6 +599,33 @@ async def get_course_analytics(course_id: str):
     }
 
 
+@app.get("/api/professor/alerts")
+async def get_professor_alerts(professor_id: str = "prof1"):
+    """Get at-risk student alerts across all courses for a professor."""
+    alerts = []
+    for course_id, course in MOCK_COURSES.items():
+        if course["professor_id"] != professor_id:
+            continue
+        for student_id in course["students"]:
+            student = MOCK_STUDENTS.get(student_id)
+            if not student:
+                continue
+            is_at_risk, risk_reasons = calculate_risk(student)
+            if is_at_risk:
+                alerts.append({
+                    "student_id": student_id,
+                    "student_name": student["name"],
+                    "course_id": course_id,
+                    "course_name": course["name"],
+                    "reasons": risk_reasons,
+                    "severity": "high" if len(risk_reasons) >= 2 else "medium",
+                    "last_session": student["last_session"],
+                })
+    # Sort by severity then student name
+    alerts.sort(key=lambda a: (0 if a["severity"] == "high" else 1, a["student_name"]))
+    return alerts
+
+
 @app.get("/api/professor/students/{student_id}/history")
 async def get_student_history(student_id: str):
     """Get detailed learning history for a student."""
@@ -592,8 +698,6 @@ async def get_student_history(student_id: str):
 
 # ============== Webcam Simulator ==============
 
-from cognitive.webcam_simulator import WebcamSimulator
-
 webcam_simulators: Dict[str, WebcamSimulator] = {}
 
 
@@ -646,6 +750,59 @@ async def set_simulator_scenario(session_id: str, scenario: str):
         sim.simulate_fatigued_student()
     
     return {"message": f"Scenario {scenario} applied", "session_id": session_id}
+
+
+# ============== Demo Mode ==============
+
+_DEMO_SCENARIOS = {
+    "struggling": "simulate_struggling_student",
+    "engaged": "simulate_engaged_student",
+    "flow": "simulate_flow_state",
+    "fatigued": "simulate_fatigued_student",
+}
+
+
+@app.post("/demo")
+async def start_demo_session(scenario: str = "engaged"):
+    """
+    Start a pre-configured demo session instantly.
+
+    Creates a WebcamSimulator with the given scenario and returns everything
+    needed to connect. Useful for starting a live demo in seconds.
+
+    Available scenarios: normal, struggling, engaged, flow, fatigued, distracted, confused
+    """
+    session_id = f"demo_{uuid.uuid4().hex[:8]}"
+
+    sim = WebcamSimulator()
+    sim.start()
+
+    # Apply scenario
+    if scenario in _DEMO_SCENARIOS:
+        getattr(sim, _DEMO_SCENARIOS[scenario])()
+    elif scenario == "confused":
+        sim.target_attention = 0.3
+        sim.target_load = 0.75
+        sim.trigger_confusion_event(120)
+    elif scenario == "distracted":
+        sim.target_attention = 0.4
+        sim.trigger_attention_dip(30)
+    # "normal" uses simulator defaults
+
+    webcam_simulators[session_id] = sim
+    initial_state = sim.get_state_dict()
+
+    return {
+        "session_id": session_id,
+        "scenario": scenario,
+        "initial_state": initial_state,
+        "available_scenarios": list(_DEMO_SCENARIOS.keys()) + ["normal", "confused", "distracted"],
+        "instructions": {
+            "change_scenario": f"POST /simulator/scenario/{session_id}?scenario=struggling",
+            "get_state": f"GET /simulator/state/{session_id}",
+            "stop": f"POST /simulator/stop/{session_id}",
+        },
+    }
 
 
 if __name__ == "__main__":
